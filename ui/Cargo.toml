@@ -1,0 +1,15 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "log-viewer"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+eframe = "0.31"
+egui = "0.31"
+egui_extras = "0.31"
+rfd = "0.15"
