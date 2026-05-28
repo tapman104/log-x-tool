@@ -61,5 +61,6 @@ pub fn load_file<P: AsRef<Path>>(path: P) -> Result<LogFile, AppError> {
     Ok(LogFile {
         path: path.to_path_buf(),
         entries,
+        format: None,
     })
 }

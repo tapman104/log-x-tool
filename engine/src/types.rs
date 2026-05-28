@@ -32,6 +32,10 @@ pub struct LogFile {
     pub path: PathBuf,
     /// All entries in order, one per line.
     pub entries: Vec<LogEntry>,
+    /// Human-readable name of the detected log format, e.g. `"Plain text"`,
+    /// `"Syslog"`, `"Logcat"`, `"JSON"`.  Set by the parser; `None` if
+    /// `parse_file` has not been called yet.
+    pub format: Option<String>,
 }
 
 /// All errors the engine can surface to the UI.

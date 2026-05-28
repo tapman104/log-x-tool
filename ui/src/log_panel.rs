@@ -7,6 +7,8 @@ const ROW_HEIGHT: f32 = 18.0;
 const HEADER_HEIGHT: f32 = 22.0;
 /// Width of the line-number column.
 const LINE_COL_WIDTH: f32 = 64.0;
+/// Width of the timestamp column.
+const TS_COL_WIDTH: f32 = 185.0;
 
 // ── Colour helpers ────────────────────────────────────────────────────────────
 
@@ -98,9 +100,11 @@ pub fn show_log_panel(ui: &mut egui::Ui, log_file: &LogFile, search: &str) {
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::exact(LINE_COL_WIDTH))
+        .column(Column::exact(TS_COL_WIDTH))
         .column(Column::remainder().clip(true))
         .header(HEADER_HEIGHT, |mut header| {
             header.col(|ui| { ui.strong("Line"); });
+            header.col(|ui| { ui.strong("Timestamp"); });
             header.col(|ui| {
                 if search.is_empty() {
                     ui.strong("Text");
@@ -127,6 +131,18 @@ pub fn show_log_panel(ui: &mut egui::Ui, log_file: &LogFile, search: &str) {
                             );
                         },
                     );
+                });
+
+                // ── Timestamp cell ───────────────────────────────────────────
+                row.col(|ui| {
+                    let ts = entry.timestamp.as_deref().unwrap_or("");
+                    if !ts.is_empty() {
+                        ui.label(
+                            egui::RichText::new(ts)
+                                .color(egui::Color32::from_gray(130))
+                                .monospace(),
+                        );
+                    }
                 });
 
                 // ── Raw-text cell ────────────────────────────────────────────

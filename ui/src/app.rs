@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use engine::{load_file, AppError, LogFile};
+use engine::{load_file, parse_file, AppError, LogFile};
 
 // ── Background loader ──────────────────────────────────────────────────────
 
@@ -80,7 +80,8 @@ impl LogViewerApp {
         if let Some(outcome) = result {
             self.load_task = None;
             match outcome {
-                Ok(lf) => {
+                Ok(mut lf) => {
+                    parse_file(&mut lf);
                     self.log_file = Some(lf);
                     self.last_error = None;
                 }
@@ -220,7 +221,7 @@ impl eframe::App for LogViewerApp {
                 // ── Loaded state ─────────────────────────────────────────────
                 // Extract display info while releasing the borrow before the
                 // mutable TextEdit borrow of self.search below.
-                let (name, entry_count) = {
+                let (name, format_badge, entry_count) = {
                     let lf = self.log_file.as_ref().unwrap();
                     let name = lf
                         .path
@@ -228,12 +229,20 @@ impl eframe::App for LogViewerApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("<unknown>")
                         .to_owned();
-                    (name, lf.entries.len())
+                    let badge = lf.format.clone().unwrap_or_default();
+                    (name, badge, lf.entries.len())
                 };
 
-                // Header row — filename + total line count
+                // Header row — filename + format badge + total line count
                 ui.horizontal(|ui| {
                     ui.heading(&name);
+                    if !format_badge.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("  {format_badge}"))
+                                .size(12.0)
+                                .color(egui::Color32::from_gray(120)),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("{entry_count} lines"))
