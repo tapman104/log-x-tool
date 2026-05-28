@@ -18,6 +18,10 @@ struct LoadTask {
 pub struct LogViewerApp {
     /// Last successfully loaded file.
     log_file: Option<LogFile>,
+    err_count: usize,
+    warn_count: usize,
+    info_count: usize,
+    debug_count: usize,
     /// Present while a background load is running.
     load_task: Option<LoadTask>,
     /// Most-recent error shown in the status bar.
@@ -40,6 +44,10 @@ impl Default for LogViewerApp {
     fn default() -> Self {
         Self {
             log_file: None,
+            err_count: 0,
+            warn_count: 0,
+            info_count: 0,
+            debug_count: 0,
             load_task: None,
             last_error: None,
             dark_mode: true,
@@ -94,6 +102,25 @@ impl LogViewerApp {
             match outcome {
                 Ok(mut lf) => {
                     parse_file(&mut lf);
+                    
+                    let mut errs = 0;
+                    let mut warns = 0;
+                    let mut infos = 0;
+                    let mut debugs = 0;
+                    for e in &lf.entries {
+                        match e.level {
+                            Some(LogLevel::Error) => errs += 1,
+                            Some(LogLevel::Warn) => warns += 1,
+                            Some(LogLevel::Info) => infos += 1,
+                            Some(LogLevel::Debug) => debugs += 1,
+                            _ => {}
+                        }
+                    }
+                    self.err_count = errs;
+                    self.warn_count = warns;
+                    self.info_count = infos;
+                    self.debug_count = debugs;
+
                     self.log_file = Some(lf);
                     self.last_error = None;
                 }
@@ -245,18 +272,8 @@ impl eframe::App for LogViewerApp {
                         .unwrap_or("<unknown>")
                         .to_owned();
                     let badge = lf.format.clone().unwrap_or_default();
-                    
-                    let mut errs = 0;
-                    let mut warns = 0;
-                    for e in &lf.entries {
-                        match e.level {
-                            Some(LogLevel::Error) => errs += 1,
-                            Some(LogLevel::Warn) => warns += 1,
-                            _ => {}
-                        }
-                    }
 
-                    (name, badge, lf.entries.len(), errs, warns)
+                    (name, badge, lf.entries.len(), self.err_count, self.warn_count)
                 };
 
                 // Header row — filename + format badge + total line count
@@ -348,6 +365,10 @@ impl eframe::App for LogViewerApp {
                         &self.search,
                         &mut self.level_filter,
                         &mut self.scroll_to_line,
+                        self.err_count,
+                        self.warn_count,
+                        self.info_count,
+                        self.debug_count,
                     );
                 }
             } else {

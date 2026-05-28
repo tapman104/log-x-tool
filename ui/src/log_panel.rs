@@ -82,6 +82,10 @@ pub fn show_log_panel(
     search: &str,
     level_filter: &mut Option<LogLevel>,
     scroll_to_line: &mut Option<usize>,
+    count_err: usize,
+    count_warn: usize,
+    count_info: usize,
+    count_debug: usize,
 ) {
     let entries      = &log_file.entries;
     let default_col  = ui.visuals().text_color();
@@ -89,20 +93,6 @@ pub fn show_log_panel(
     let search_lower = search.to_lowercase();
 
     // ── Filter Buttons ───────────────────────────────────────────────────────
-    let mut count_err = 0;
-    let mut count_warn = 0;
-    let mut count_info = 0;
-    let mut count_debug = 0;
-    for e in entries {
-        match e.level {
-            Some(LogLevel::Error) => count_err += 1,
-            Some(LogLevel::Warn) => count_warn += 1,
-            Some(LogLevel::Info) => count_info += 1,
-            Some(LogLevel::Debug) => count_debug += 1,
-            _ => {}
-        }
-    }
-
     ui.horizontal(|ui| {
         let mut add_btn = |label: &str, lvl: Option<LogLevel>, count: usize| {
             let text = format!("{} ({})", label, count);
