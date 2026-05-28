@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use engine::{load_file, parse_file, AppError, LogFile};
+use engine::{load_file, parse_file, AppError, LogFile, LogLevel};
 
 // ── Background loader ──────────────────────────────────────────────────────
 
@@ -26,6 +26,14 @@ pub struct LogViewerApp {
     dark_mode: bool,
     /// Current search string — filters and highlights the log table.
     search: String,
+    /// Current log level filter.
+    level_filter: Option<LogLevel>,
+    /// Jump to line input.
+    jump_input: String,
+    /// Pending line jump request.
+    scroll_to_line: Option<usize>,
+    /// Request focus on jump input.
+    focus_jump: bool,
 }
 
 impl Default for LogViewerApp {
@@ -36,6 +44,10 @@ impl Default for LogViewerApp {
             last_error: None,
             dark_mode: true,
             search: String::new(),
+            level_filter: None,
+            jump_input: String::new(),
+            scroll_to_line: None,
+            focus_jump: false,
         }
     }
 }
@@ -182,6 +194,9 @@ impl eframe::App for LogViewerApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
             self.pick_and_open();
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
+            self.focus_jump = true;
+        }
 
         // ── Error / status bar (dismissible) ─────────────────────────────────
         if self.last_error.is_some() {
@@ -221,7 +236,7 @@ impl eframe::App for LogViewerApp {
                 // ── Loaded state ─────────────────────────────────────────────
                 // Extract display info while releasing the borrow before the
                 // mutable TextEdit borrow of self.search below.
-                let (name, format_badge, entry_count) = {
+                let (name, format_badge, entry_count, err_count, warn_count) = {
                     let lf = self.log_file.as_ref().unwrap();
                     let name = lf
                         .path
@@ -230,7 +245,18 @@ impl eframe::App for LogViewerApp {
                         .unwrap_or("<unknown>")
                         .to_owned();
                     let badge = lf.format.clone().unwrap_or_default();
-                    (name, badge, lf.entries.len())
+                    
+                    let mut errs = 0;
+                    let mut warns = 0;
+                    for e in &lf.entries {
+                        match e.level {
+                            Some(LogLevel::Error) => errs += 1,
+                            Some(LogLevel::Warn) => warns += 1,
+                            _ => {}
+                        }
+                    }
+
+                    (name, badge, lf.entries.len(), errs, warns)
                 };
 
                 // Header row — filename + format badge + total line count
@@ -243,11 +269,54 @@ impl eframe::App for LogViewerApp {
                                 .color(egui::Color32::from_gray(120)),
                         );
                     }
+                    if err_count > 0 || warn_count > 0 {
+                        ui.add_space(8.0);
+                        if err_count > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("{} errors", err_count))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                            );
+                        }
+                        if err_count > 0 && warn_count > 0 {
+                            ui.label(
+                                egui::RichText::new("·")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_gray(120)),
+                            );
+                        }
+                        if warn_count > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("{} warnings", warn_count))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(255, 200, 80)),
+                            );
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("{entry_count} lines"))
                                 .color(egui::Color32::from_gray(140)),
                         );
+
+                        let jump_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.jump_input)
+                                .hint_text("Go to line…")
+                                .desired_width(110.0),
+                        );
+
+                        if self.focus_jump {
+                            jump_resp.request_focus();
+                            self.focus_jump = false;
+                        }
+
+                        if jump_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            if let Ok(n) = self.jump_input.trim().parse::<usize>() {
+                                let clamped = n.max(1).min(entry_count);
+                                self.scroll_to_line = Some(clamped);
+                            }
+                            self.jump_input.clear();
+                        }
                     });
                 });
 
@@ -273,7 +342,13 @@ impl eframe::App for LogViewerApp {
 
                 // Re-borrow log_file for the table (search TextEdit borrow released).
                 if let Some(ref lf) = self.log_file {
-                    crate::log_panel::show_log_panel(ui, lf, &self.search);
+                    crate::log_panel::show_log_panel(
+                        ui,
+                        lf,
+                        &self.search,
+                        &mut self.level_filter,
+                        &mut self.scroll_to_line,
+                    );
                 }
             } else {
                 // ── Empty state ──────────────────────────────────────────────

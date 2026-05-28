@@ -105,6 +105,67 @@ fn extract_string_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+/// Search for the JSON key `name` in `line` and return its value as a `u64`,
+/// for the case where the value is a bare JSON number (not quoted).
+///
+/// Uses the same key-position guard as [`extract_string_field`].  Returns
+/// `None` if the key is absent, not in key position, or its value is not a
+/// sequence of ASCII digits.
+fn extract_number_field(line: &str, name: &str) -> Option<u64> {
+    let b = line.as_bytes();
+    let key_with_quotes = format!("\"{}\"", name);
+    let kq = key_with_quotes.as_bytes();
+
+    let mut search_from = 0;
+    while search_from + kq.len() <= b.len() {
+        let found = b[search_from..]
+            .windows(kq.len())
+            .position(|w| w == kq)
+            .map(|p| p + search_from)?;
+
+        // Key-position guard (same logic as extract_string_field)
+        let in_key_position = {
+            let mut j = found.saturating_sub(1);
+            while j > 0 && (b[j] == b' ' || b[j] == b'\t') {
+                j -= 1;
+            }
+            b[j] == b'{' || b[j] == b','
+        };
+
+        if !in_key_position {
+            search_from = found + kq.len();
+            continue;
+        }
+
+        // Advance past the key and the colon
+        let after_key = found + kq.len();
+        let colon_pos = b[after_key..].iter().position(|&c| c == b':')?;
+        let after_colon = after_key + colon_pos + 1;
+
+        // Skip whitespace
+        let value_start_offset = b[after_colon..]
+            .iter()
+            .position(|&c| c != b' ' && c != b'\t')?;
+        let value_start = after_colon + value_start_offset;
+
+        // Value must start with a digit (bare JSON number, not quoted)
+        if !b[value_start].is_ascii_digit() {
+            return None;
+        }
+
+        // Consume consecutive digits
+        let digit_len = b[value_start..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+
+        let num_str = &line[value_start..value_start + digit_len];
+        return num_str.parse::<u64>().ok();
+    }
+
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Level parsing
 // ---------------------------------------------------------------------------
@@ -182,8 +243,14 @@ pub fn parse(log_file: &mut LogFile) {
         let needs_level = matches!(&entry.level, None | Some(LogLevel::Unknown));
         if needs_level {
             for &key in LVL_KEYS {
+                // Try string value first (e.g. "level":"warn")
                 if let Some(val) = extract_string_field(line, key) {
                     entry.level = Some(level_from_str(val));
+                    break;
+                }
+                // Fall back to bare number (e.g. "level":50 — Bunyan/Pino)
+                if let Some(n) = extract_number_field(line, key) {
+                    entry.level = Some(level_from_str(&n.to_string()));
                     break;
                 }
             }
@@ -355,13 +422,10 @@ mod tests {
     #[test]
     fn parse_bunyan_numeric_level() {
         let raw = r#"{"time":"2024-01-01T00:00:00Z","level":50,"msg":"test"}"#;
-        // numeric value (not a string) — level field won't match our string extractor,
-        // so level stays Unknown; this test documents the current behaviour.
         let mut lf = make_log(vec![make_entry(raw, Some(LogLevel::Unknown))]);
         parse(&mut lf);
         assert_eq!(lf.entries[0].timestamp.as_deref(), Some("2024-01-01T00:00:00Z"));
-        // level stays Unknown because the value is a JSON number, not a string
-        assert_eq!(lf.entries[0].level, Some(LogLevel::Unknown));
+        assert_eq!(lf.entries[0].level, Some(LogLevel::Warn));
     }
 
     #[test]

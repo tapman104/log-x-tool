@@ -76,32 +76,85 @@ fn append_highlighted(
 ///
 /// `search` — when non-empty, only rows whose `raw` contains the string
 /// (case-insensitive) are shown, and every match is highlighted in amber.
-pub fn show_log_panel(ui: &mut egui::Ui, log_file: &LogFile, search: &str) {
+pub fn show_log_panel(
+    ui: &mut egui::Ui,
+    log_file: &LogFile,
+    search: &str,
+    level_filter: &mut Option<LogLevel>,
+    scroll_to_line: &mut Option<usize>,
+) {
     let entries      = &log_file.entries;
     let default_col  = ui.visuals().text_color();
     let font_id      = egui::TextStyle::Monospace.resolve(ui.style());
     let search_lower = search.to_lowercase();
 
+    // ── Filter Buttons ───────────────────────────────────────────────────────
+    let mut count_err = 0;
+    let mut count_warn = 0;
+    let mut count_info = 0;
+    let mut count_debug = 0;
+    for e in entries {
+        match e.level {
+            Some(LogLevel::Error) => count_err += 1,
+            Some(LogLevel::Warn) => count_warn += 1,
+            Some(LogLevel::Info) => count_info += 1,
+            Some(LogLevel::Debug) => count_debug += 1,
+            _ => {}
+        }
+    }
+
+    ui.horizontal(|ui| {
+        let mut add_btn = |label: &str, lvl: Option<LogLevel>, count: usize| {
+            let text = format!("{} ({})", label, count);
+            let is_selected = *level_filter == lvl;
+            if ui.selectable_label(is_selected, text).clicked() {
+                if is_selected {
+                    *level_filter = None;
+                } else {
+                    *level_filter = lvl;
+                }
+            }
+        };
+
+        add_btn("ALL", None, entries.len());
+        add_btn("ERROR", Some(LogLevel::Error), count_err);
+        add_btn("WARN", Some(LogLevel::Warn), count_warn);
+        add_btn("INFO", Some(LogLevel::Info), count_info);
+        add_btn("DEBUG", Some(LogLevel::Debug), count_debug);
+    });
+    ui.add_space(4.0);
+
     // ── Filter ───────────────────────────────────────────────────────────────
-    // Collect the indices of rows that match the search. When search is empty
-    // every row passes. Using indices keeps us O(visible) during rendering.
-    let indices: Vec<usize> = if search.is_empty() {
-        (0..entries.len()).collect()
-    } else {
-        (0..entries.len())
-            .filter(|&i| entries[i].raw.to_lowercase().contains(&search_lower))
-            .collect()
-    };
+    // Collect the indices of rows that match the search and level filter.
+    // Using indices keeps us O(visible) during rendering.
+    let indices: Vec<usize> = (0..entries.len())
+        .filter(|&i| {
+            let e = &entries[i];
+            let passes_search = search.is_empty() || e.raw.to_lowercase().contains(&search_lower);
+            let passes_level = match level_filter {
+                Some(lvl) => e.level.as_ref() == Some(lvl),
+                None => true,
+            };
+            passes_search && passes_level
+        })
+        .collect();
     let num_rows = indices.len();
 
     // ── Table ────────────────────────────────────────────────────────────────
-    TableBuilder::new(ui)
+    let mut builder = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::exact(LINE_COL_WIDTH))
         .column(Column::exact(TS_COL_WIDTH))
-        .column(Column::remainder().clip(true))
+        .column(Column::remainder().clip(true));
+
+    if let Some(n) = *scroll_to_line {
+        builder = builder.scroll_to_row(n - 1, Some(egui::Align::Center));
+        *scroll_to_line = None;
+    }
+
+    builder
         .header(HEADER_HEIGHT, |mut header| {
             header.col(|ui| { ui.strong("Line"); });
             header.col(|ui| { ui.strong("Timestamp"); });
