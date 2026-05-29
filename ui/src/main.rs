@@ -1,8 +1,13 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod log_panel;
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default(); // DnD on by default in eframe 0.31
+    let mut options = eframe::NativeOptions::default();
+    options.viewport.icon = std::sync::Arc::new(
+        eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon.png")[..]).unwrap()
+    ).into();
     eframe::run_native(
         "Log Viewer",
         options,

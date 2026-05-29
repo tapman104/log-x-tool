@@ -82,15 +82,12 @@ pub fn show_log_panel(
     search: &str,
     level_filter: &mut Option<LogLevel>,
     scroll_to_line: &mut Option<usize>,
-    count_err: usize,
-    count_warn: usize,
-    count_info: usize,
-    count_debug: usize,
+    filtered_indices: &[usize],
+    search_counts: (usize, usize, usize, usize, usize),
 ) {
     let entries      = &log_file.entries;
     let default_col  = ui.visuals().text_color();
     let font_id      = egui::TextStyle::Monospace.resolve(ui.style());
-    let search_lower = search.to_lowercase();
 
     // ── Filter Buttons ───────────────────────────────────────────────────────
     ui.horizontal(|ui| {
@@ -106,29 +103,15 @@ pub fn show_log_panel(
             }
         };
 
-        add_btn("ALL", None, entries.len());
-        add_btn("ERROR", Some(LogLevel::Error), count_err);
-        add_btn("WARN", Some(LogLevel::Warn), count_warn);
-        add_btn("INFO", Some(LogLevel::Info), count_info);
-        add_btn("DEBUG", Some(LogLevel::Debug), count_debug);
+        add_btn("ALL", None, search_counts.0);
+        add_btn("ERROR", Some(LogLevel::Error), search_counts.1);
+        add_btn("WARN", Some(LogLevel::Warn), search_counts.2);
+        add_btn("INFO", Some(LogLevel::Info), search_counts.3);
+        add_btn("DEBUG", Some(LogLevel::Debug), search_counts.4);
     });
     ui.add_space(4.0);
 
-    // ── Filter ───────────────────────────────────────────────────────────────
-    // Collect the indices of rows that match the search and level filter.
-    // Using indices keeps us O(visible) during rendering.
-    let indices: Vec<usize> = (0..entries.len())
-        .filter(|&i| {
-            let e = &entries[i];
-            let passes_search = search.is_empty() || e.raw.to_lowercase().contains(&search_lower);
-            let passes_level = match level_filter {
-                Some(lvl) => e.level.as_ref() == Some(lvl),
-                None => true,
-            };
-            passes_search && passes_level
-        })
-        .collect();
-    let num_rows = indices.len();
+    let num_rows = filtered_indices.len();
 
     // ── Table ────────────────────────────────────────────────────────────────
     let mut builder = TableBuilder::new(ui)
@@ -159,11 +142,19 @@ pub fn show_log_panel(
         })
         .body(|body| {
             body.rows(ROW_HEIGHT, num_rows, |mut row| {
-                let entry      = &entries[indices[row.index()]];
+                let entry      = &entries[filtered_indices[row.index()]];
                 let text_color = level_color(&entry.level, default_col);
+                let bg_color   = match entry.level {
+                    Some(LogLevel::Error) => Some(egui::Color32::from_rgba_unmultiplied(255, 50, 50, 25)),
+                    Some(LogLevel::Warn)  => Some(egui::Color32::from_rgba_unmultiplied(255, 180, 50, 20)),
+                    _ => None,
+                };
 
                 // ── Line-number cell ─────────────────────────────────────────
                 row.col(|ui| {
+                    if let Some(bg) = bg_color {
+                        ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -178,6 +169,9 @@ pub fn show_log_panel(
 
                 // ── Timestamp cell ───────────────────────────────────────────
                 row.col(|ui| {
+                    if let Some(bg) = bg_color {
+                        ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    }
                     let ts = entry.timestamp.as_deref().unwrap_or("");
                     if !ts.is_empty() {
                         ui.label(
@@ -192,6 +186,9 @@ pub fn show_log_panel(
                 // Uses LayoutJob so level colour and search highlight can coexist
                 // in a single widget without extra allocations.
                 row.col(|ui| {
+                    if let Some(bg) = bg_color {
+                        ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    }
                     let base_fmt = egui::text::TextFormat {
                         font_id: font_id.clone(),
                         color:   text_color,
@@ -199,7 +196,13 @@ pub fn show_log_panel(
                     };
                     let mut job = egui::text::LayoutJob::default();
                     append_highlighted(&mut job, &entry.raw, search, base_fmt);
-                    ui.add(egui::Label::new(job).truncate());
+                    let response = ui.add(egui::Label::new(job).truncate().sense(egui::Sense::click()));
+                    response.context_menu(|ui| {
+                        if ui.button("Copy line").clicked() {
+                            ui.ctx().copy_text(entry.raw.clone());
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
