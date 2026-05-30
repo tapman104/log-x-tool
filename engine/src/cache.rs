@@ -84,14 +84,6 @@ pub fn cache_path(source: &Path) -> Option<PathBuf> {
 
 // ── Helpers — little-endian I/O ─────────────────────────────────────────────
 
-fn read_u8(buf: &[u8], off: usize) -> u8 {
-    buf[off]
-}
-
-fn read_u16_le(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
 fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
@@ -110,25 +102,28 @@ fn write_u64_le(w: &mut impl Write, v: u64) -> std::io::Result<()> {
 /// - The cached `file_size` or `mtime_secs` does not match current metadata
 ///   (i.e. the source file was modified since the cache was written).
 /// - Any I/O error occurs while reading the cache.
+///
+/// Memory usage: O(line_count × 12 bytes) for the offsets + records Vecs.
+/// The old `std::fs::read` implementation allocated a second copy of the
+/// entire cache (~1.2 GB for 100 M lines) on top of that.  This version
+/// streams directly into the destination Vecs without any extra buffer.
 pub fn try_load(source: &Path) -> Option<ParsedIndex> {
+    use std::io::{BufReader, Read};
+
     let cp = cache_path(source)?;
+    let cache_file = std::fs::File::open(&cp).ok()?;
+    let mut r = BufReader::new(cache_file);
 
-    // ── Read the whole cache file into memory ────────────────────────────────
-    // Cache files are typically a few hundred MB at most (8 bytes × line_count
-    // for offsets + 4 bytes × line_count for records).  For a 100 M-line file
-    // that is ~1.2 GB — still worthwhile vs re-scanning the source file.
-    let cache_bytes = std::fs::read(&cp).ok()?;
+    // ── Read and validate the 32-byte header ────────────────────────────────
+    let mut hdr = [0u8; HEADER_LEN];
+    r.read_exact(&mut hdr).ok()?;
 
-    // ── Validate header ──────────────────────────────────────────────────────
-    if cache_bytes.len() < HEADER_LEN {
+    if &hdr[0..8] != MAGIC {
         return None;
     }
-    if &cache_bytes[0..8] != MAGIC {
-        return None;
-    }
-    let cached_file_size  = read_u64_le(&cache_bytes,  8);
-    let cached_mtime_secs = read_u64_le(&cache_bytes, 16);
-    let line_count        = read_u64_le(&cache_bytes, 24) as usize;
+    let cached_file_size  = read_u64_le(&hdr,  8);
+    let cached_mtime_secs = read_u64_le(&hdr, 16);
+    let line_count        = read_u64_le(&hdr, 24) as usize;
 
     // ── Validate freshness against live metadata ─────────────────────────────
     let meta = std::fs::metadata(source).ok()?;
@@ -141,49 +136,43 @@ pub fn try_load(source: &Path) -> Option<ParsedIndex> {
         .unwrap_or(0);
 
     if live_file_size != cached_file_size || live_mtime_secs != cached_mtime_secs {
-        // Cache is stale — source file changed.
+        // Cache is stale — discard after only 32 bytes read.
         return None;
     }
 
-    // ── Validate body length ─────────────────────────────────────────────────
-    let offsets_bytes = line_count * 8;
-    let records_bytes = line_count * RECORD_BYTES;
-    let min_body = HEADER_LEN + offsets_bytes + records_bytes + 1; // +1 for format_len byte
-    if cache_bytes.len() < min_body {
-        return None;
+    // ── Stream offsets directly into a pre-allocated Vec ────────────────────
+    let mut offsets = Vec::with_capacity(line_count);
+    {
+        let mut buf = [0u8; 8];
+        for _ in 0..line_count {
+            r.read_exact(&mut buf).ok()?;
+            offsets.push(u64::from_le_bytes(buf));
+        }
     }
 
-    // ── Deserialise offsets ──────────────────────────────────────────────────
-    let offsets_start = HEADER_LEN;
-    let offsets: Vec<u64> = (0..line_count)
-        .map(|i| read_u64_le(&cache_bytes, offsets_start + i * 8))
-        .collect();
-
-    // ── Deserialise records ──────────────────────────────────────────────────
-    let records_start = offsets_start + offsets_bytes;
-    let records: Vec<LineRecord> = (0..line_count)
-        .map(|i| {
-            let base = records_start + i * RECORD_BYTES;
-            LineRecord {
-                level:    level_from_u8(read_u8(&cache_bytes, base)),
-                ts_start: read_u16_le(&cache_bytes, base + 1),
-                ts_len:   read_u8(&cache_bytes, base + 3),
-            }
-        })
-        .collect();
-
-    // ── Deserialise footer (format string) ──────────────────────────────────
-    let footer_start = records_start + records_bytes;
-    let format_len = read_u8(&cache_bytes, footer_start) as usize;
-    let format_end = footer_start + 1 + format_len;
-    if cache_bytes.len() < format_end {
-        return None;
+    // ── Stream records directly into a pre-allocated Vec ────────────────────
+    let mut records = Vec::with_capacity(line_count);
+    {
+        let mut buf = [0u8; RECORD_BYTES];
+        for _ in 0..line_count {
+            r.read_exact(&mut buf).ok()?;
+            records.push(LineRecord {
+                level:    level_from_u8(buf[0]),
+                ts_start: u16::from_le_bytes([buf[1], buf[2]]),
+                ts_len:   buf[3],
+            });
+        }
     }
-    let format = std::str::from_utf8(&cache_bytes[footer_start + 1..format_end])
-        .ok()?
-        .to_owned();
 
-    // ── Re-open the source file and memory-map it ────────────────────────────
+    // ── Read the footer (format string) ─────────────────────────────────────
+    let mut fmt_len_buf = [0u8; 1];
+    r.read_exact(&mut fmt_len_buf).ok()?;
+    let fmt_len = fmt_len_buf[0] as usize;
+    let mut fmt_buf = vec![0u8; fmt_len];
+    r.read_exact(&mut fmt_buf).ok()?;
+    let format = std::str::from_utf8(&fmt_buf).ok()?.to_owned();
+
+    // ── Memory-map the source file ───────────────────────────────────────────
     let file = std::fs::File::open(source).ok()?;
     // Safety: read-only map; we do not mutate the file.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };

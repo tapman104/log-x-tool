@@ -23,7 +23,7 @@ struct LoadTask {
 struct SearchTask {
     /// Receives batches of matching indices as the search progresses.
     /// Indices are sent as `u32` (RoaringBitmap's native element type).
-    rx: mpsc::Receiver<Vec<u32>>,
+    rx: mpsc::Receiver<Result<Vec<u32>, String>>,
     /// Sending a value to this channel cancels the worker.
     cancel_tx: mpsc::SyncSender<()>,
 }
@@ -84,6 +84,8 @@ pub struct LogViewerApp {
     /// OS file-system watcher.  Present iff `follow_mode` is `true`.
     /// Dropping it automatically unregisters the OS watch.
     watcher: Option<notify::RecommendedWatcher>,
+    /// Range of lines appended during follow mode that still need to be searched and added to the UI bitmap.
+    pending_follow_lines: std::ops::Range<usize>,
 }
 
 impl Default for LogViewerApp {
@@ -118,6 +120,7 @@ impl Default for LogViewerApp {
             recent_files: Vec::new(),
             follow_mode: false,
             watcher: None,
+            pending_follow_lines: 0..0,
         };
         app.load_config();
         app
@@ -292,6 +295,13 @@ impl LogViewerApp {
                     self.save_config();
 
                     self.level_counts = counts;
+                    self.search_counts = (
+                        parsed.lines.len(),
+                        counts[0],
+                        counts[1],
+                        counts[2],
+                        counts[3],
+                    );
                     self.file_size_bytes = file_size;
                     self.needs_filter_update = true;
 
@@ -314,37 +324,37 @@ impl LogViewerApp {
         self.filtered_count = 0;
         self.search_complete = false;
 
-        let (result_tx, result_rx) = mpsc::channel::<Vec<u32>>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<Vec<u32>, String>>();
         let (cancel_tx, cancel_rx) = mpsc::sync_channel::<()>(1);
 
         std::thread::spawn(move || {
             let query_lower = query.to_lowercase();
-            let query_bytes = query_lower.as_bytes();
             let mut batch: Vec<u32> = Vec::with_capacity(4096);
 
             for i in 0..parsed.lines.len() {
                 if cancel_rx.try_recv().is_ok() { return; }
 
-                // RoaringBitmap indices are u32; files with ≥ 2^32 lines are not
-                // supported at current hardware limits.
-                assert!(i < u32::MAX as usize, "line index exceeds u32::MAX");
+                if i >= u32::MAX as usize {
+                    let _ = result_tx.send(Err("Line index exceeds u32::MAX (4+ billion lines). Search truncated.".into()));
+                    return;
+                }
 
                 let passes_level = match &level {
                     Some(lvl) => parsed.level_of(i) == *lvl,
                     None => true,
                 };
-                let passes_search = query_bytes.is_empty()
-                    || memchr::memmem::find(parsed.lines.line_bytes(i), query_bytes).is_some();
+                let passes_search = query_lower.is_empty()
+                    || parsed.lines.line_str(i).to_lowercase().contains(&query_lower);
 
                 if passes_level && passes_search {
                     batch.push(i as u32);
                     if batch.len() == 4096 {
-                        if result_tx.send(std::mem::take(&mut batch)).is_err() { return; }
+                        if result_tx.send(Ok(std::mem::take(&mut batch))).is_err() { return; }
                     }
                 }
             }
             if !batch.is_empty() {
-                let _ = result_tx.send(batch);
+                let _ = result_tx.send(Ok(batch));
             }
         });
 
@@ -352,19 +362,66 @@ impl LogViewerApp {
     }
 
     fn poll_search_task(&mut self) {
-        let done = if let Some(ref t) = self.search_task {
+        let mut newly_done = false;
+        if let Some(ref t) = self.search_task {
             loop {
                 match t.rx.try_recv() {
-                    Ok(batch) => {
+                    Ok(Ok(batch)) => {
                         self.filtered_bitmap.extend(batch);
                         self.filtered_count = self.filtered_bitmap.len();
                     }
-                    Err(mpsc::TryRecvError::Empty) => break false,
-                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                    Ok(Err(msg)) => {
+                        self.last_error = Some(msg);
+                        newly_done = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        newly_done = true;
+                        break;
+                    }
                 }
             }
-        } else { true };
-        if done { self.search_task = None; self.search_complete = true; }
+        }
+
+        if newly_done {
+            self.search_task = None;
+            self.search_complete = true;
+
+            // Compute search-scoped counts, as requested by Bug 2.
+            if let Some(ref parsed) = self.parsed {
+                // If there's no search query, fall back to global counts so the
+                // user can still see total counts across all levels.
+                if self.search.is_empty() {
+                    let all = parsed.lines.len();
+                    self.search_counts = (
+                        all,
+                        self.level_counts[0],
+                        self.level_counts[1],
+                        self.level_counts[2],
+                        self.level_counts[3],
+                    );
+                } else {
+                    let mut all = 0;
+                    let mut err = 0;
+                    let mut warn = 0;
+                    let mut info = 0;
+                    let mut debug = 0;
+
+                    for i in self.filtered_bitmap.iter() {
+                        all += 1;
+                        match parsed.level_of(i as usize) {
+                            engine::LogLevel::Error => err += 1,
+                            engine::LogLevel::Warn => warn += 1,
+                            engine::LogLevel::Info => info += 1,
+                            engine::LogLevel::Debug => debug += 1,
+                            _ => {}
+                        }
+                    }
+                    self.search_counts = (all, err, warn, info, debug);
+                }
+            }
+        }
     }
 
     // ── Follow mode ──────────────────────────────────────────────────────────
@@ -427,8 +484,8 @@ impl LogViewerApp {
             return;
         }
 
-        if current_size == indexed_size {
-            return; // no change this frame
+        if current_size == indexed_size && self.pending_follow_lines.is_empty() {
+            return; // no change this frame, and no backlog
         }
 
         // ── File grew — incremental update ────────────────────────────────────
@@ -443,19 +500,30 @@ impl LogViewerApp {
         };
         // ↑ Mutable borrow of `self.parsed` ends here.
 
-        // Phase 2: update self fields now that the ParsedIndex borrow is gone.
+        // Phase 2: update self fields incrementally.
         if let Some(first_new_line) = first_new_line {
             let total_lines = self.parsed.as_ref().map_or(0, |p| p.lines.len());
+            if self.pending_follow_lines.is_empty() {
+                self.pending_follow_lines = first_new_line..total_lines;
+            } else {
+                self.pending_follow_lines.end = total_lines;
+            }
+        }
 
-            // Pre-compute filter params (avoids borrow conflicts inside the loop).
+        if !self.pending_follow_lines.is_empty() {
+            let chunk_start = self.pending_follow_lines.start;
+            let chunk_end = (chunk_start + 1000).min(self.pending_follow_lines.end);
+            
             let query_lower = self.search.to_lowercase();
-            let query_bytes: Vec<u8> = query_lower.bytes().collect();
             let level_filter = self.level_filter.clone();
 
-            // Walk only the new lines to update the bitmap and level counts.
             if let Some(ref parsed) = self.parsed {
-                for i in first_new_line..total_lines {
-                    assert!(i < u32::MAX as usize, "line index exceeds u32::MAX");
+                for i in chunk_start..chunk_end {
+                    if i >= u32::MAX as usize {
+                        self.last_error = Some("Line index exceeds u32::MAX. Follow mode truncated.".into());
+                        self.stop_following();
+                        break;
+                    }
 
                     let level = parsed.records[i].level;
                     self.level_counts[usize::from(level)] += 1;
@@ -464,22 +532,18 @@ impl LogViewerApp {
                         Some(lvl) => level == *lvl,
                         None => true,
                     };
-                    let passes_search = query_bytes.is_empty()
-                        || memchr::memmem::find(
-                            parsed.lines.line_bytes(i),
-                            &query_bytes,
-                        )
-                        .is_some();
+                    let passes_search = query_lower.is_empty()
+                        || parsed.lines.line_str(i).to_lowercase().contains(&query_lower);
 
                     if passes_level && passes_search {
                         self.filtered_bitmap.insert(i as u32);
+                        self.scroll_to_line = Some(i + 1);
                     }
                 }
             }
 
             self.filtered_count = self.filtered_bitmap.len();
-            // Auto-scroll to the last line so the user sees new output.
-            self.scroll_to_line = Some(total_lines);
+            self.pending_follow_lines.start = chunk_end;
         }
     }
 }
@@ -522,6 +586,9 @@ impl eframe::App for LogViewerApp {
         // Arc::get_mut inside poll_follow has a good chance of succeeding).
         if self.follow_mode && self.load_task.is_none() && self.search_task.is_none() {
             self.poll_follow();
+            if !self.pending_follow_lines.is_empty() {
+                ctx.request_repaint();
+            }
         }
 
         // ── Dynamic title bar ────────────────────────────────────────────────
@@ -880,14 +947,7 @@ impl eframe::App for LogViewerApp {
                         self.match_cursor = None;
                     }
 
-                    // With the background search task, we revert to showing global counts on the filter buttons.
-                    let all = parsed.lines.len();
-                    let err = self.level_counts[0];
-                    let warn = self.level_counts[1];
-                    let info = self.level_counts[2];
-                    let debug = self.level_counts[3];
-                    self.search_counts = (all, err, warn, info, debug);
-
+                    // Search counts are now computed once when the search finishes (in poll_search_task).
                     crate::log_panel::show_log_panel(
                         ui,
                         parsed,
