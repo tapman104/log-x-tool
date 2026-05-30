@@ -194,19 +194,40 @@ impl LogViewerApp {
         self.load_progress = None;
 
         std::thread::spawn(move || {
-            let tx_clone = tx.clone();
-            let res = engine::index_file_with_progress(&path_clone, move |scanned, total| {
-                let _ = tx_clone.send(LoadProgress::Progress { scanned, total });
-            }).map(|idx| {
-                let parsed = engine::parse_index(idx);
-                let mut counts = [0usize; 6];
-                for r in &parsed.records {
-                    let c_idx: usize = r.level.into();
-                    counts[c_idx] += 1;
-                }
-                let file_size_bytes = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
-                (parsed, counts, file_size_bytes)
-            });
+            // ── Fast path: sidecar cache hit ─────────────────────────────────
+            // try_load validates file_size + mtime, so a stale cache is
+            // automatically rejected.  A cache hit skips the full mmap scan.
+            let res: Result<(engine::ParsedIndex, [usize; 6], u64), engine::AppError> =
+                if let Some(parsed) = engine::cache::try_load(&path_clone) {
+                    let mut counts = [0usize; 6];
+                    for r in &parsed.records {
+                        let c_idx: usize = r.level.into();
+                        counts[c_idx] += 1;
+                    }
+                    let file_size_bytes =
+                        std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
+                    Ok((parsed, counts, file_size_bytes))
+                } else {
+                    // ── Slow path: full scan + parse ─────────────────────────
+                    let tx_clone = tx.clone();
+                    engine::index_file_with_progress(&path_clone, move |scanned, total| {
+                        let _ = tx_clone.send(LoadProgress::Progress { scanned, total });
+                    })
+                    .map(|idx| {
+                        let parsed = engine::parse_index(idx);
+                        // Persist the cache so the next open is instant.
+                        engine::cache::save(&parsed, &path_clone);
+                        let mut counts = [0usize; 6];
+                        for r in &parsed.records {
+                            let c_idx: usize = r.level.into();
+                            counts[c_idx] += 1;
+                        }
+                        let file_size_bytes =
+                            std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
+                        (parsed, counts, file_size_bytes)
+                    })
+                };
+
             let _ = tx.send(LoadProgress::Done(res));
         });
         self.load_task = Some(LoadTask { path, rx });

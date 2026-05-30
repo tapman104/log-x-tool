@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 memmap2 = "0.9"
 rayon = "1"
+dirs = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3"
