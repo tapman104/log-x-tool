@@ -1,5 +1,5 @@
 use egui_extras::{Column, TableBuilder};
-use engine::{LogFile, LogLevel};
+use engine::LogLevel;
 
 /// Row height in logical pixels (fixed — required for O(1) virtual-scroll math).
 const ROW_HEIGHT: f32 = 18.0;
@@ -78,14 +78,13 @@ fn append_highlighted(
 /// (case-insensitive) are shown, and every match is highlighted in amber.
 pub fn show_log_panel(
     ui: &mut egui::Ui,
-    log_file: &LogFile,
+    parsed: &engine::ParsedIndex,
     search: &str,
     level_filter: &mut Option<LogLevel>,
     scroll_to_line: &mut Option<usize>,
-    filtered_indices: &[usize],
+    filtered_bitmap: &roaring::RoaringBitmap,
     search_counts: (usize, usize, usize, usize, usize),
 ) {
-    let entries      = &log_file.entries;
     let default_col  = ui.visuals().text_color();
     let font_id      = egui::TextStyle::Monospace.resolve(ui.style());
 
@@ -111,7 +110,7 @@ pub fn show_log_panel(
     });
     ui.add_space(4.0);
 
-    let num_rows = filtered_indices.len();
+    let num_rows = filtered_bitmap.len() as usize;
 
     // ── Table ────────────────────────────────────────────────────────────────
     let mut builder = TableBuilder::new(ui)
@@ -142,11 +141,16 @@ pub fn show_log_panel(
         })
         .body(|body| {
             body.rows(ROW_HEIGHT, num_rows, |mut row| {
-                let entry      = &entries[filtered_indices[row.index()]];
-                let text_color = level_color(&entry.level, default_col);
-                let bg_color   = match entry.level {
-                    Some(LogLevel::Error) => Some(egui::Color32::from_rgba_unmultiplied(255, 50, 50, 25)),
-                    Some(LogLevel::Warn)  => Some(egui::Color32::from_rgba_unmultiplied(255, 180, 50, 20)),
+                // select(rank) translates a virtual row index to an absolute line index.
+                // O(log n) on RoaringBitmap — fast enough for row rendering.
+                let i = filtered_bitmap
+                    .select(row.index() as u32)
+                    .unwrap() as usize;
+                let level = parsed.level_of(i);
+                let text_color = level_color(&Some(level), default_col);
+                let bg_color   = match level {
+                    LogLevel::Error => Some(egui::Color32::from_rgba_unmultiplied(255, 50, 50, 25)),
+                    LogLevel::Warn  => Some(egui::Color32::from_rgba_unmultiplied(255, 180, 50, 20)),
                     _ => None,
                 };
 
@@ -159,7 +163,7 @@ pub fn show_log_panel(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             ui.label(
-                                egui::RichText::new(entry.line_number.to_string())
+                                egui::RichText::new((i + 1).to_string())
                                     .color(egui::Color32::from_gray(110))
                                     .monospace(),
                             );
@@ -172,7 +176,7 @@ pub fn show_log_panel(
                     if let Some(bg) = bg_color {
                         ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
                     }
-                    let ts = entry.timestamp.as_deref().unwrap_or("");
+                    let ts = parsed.timestamp_of(i).unwrap_or("");
                     if !ts.is_empty() {
                         ui.label(
                             egui::RichText::new(ts)
@@ -195,11 +199,12 @@ pub fn show_log_panel(
                         ..Default::default()
                     };
                     let mut job = egui::text::LayoutJob::default();
-                    append_highlighted(&mut job, &entry.raw, search, base_fmt);
+                    let raw = parsed.lines.line_str(i);
+                    append_highlighted(&mut job, raw, search, base_fmt);
                     let response = ui.add(egui::Label::new(job).truncate().sense(egui::Sense::click()));
                     response.context_menu(|ui| {
                         if ui.button("Copy line").clicked() {
-                            ui.ctx().copy_text(entry.raw.clone());
+                            ui.ctx().copy_text(raw.to_owned());
                             ui.close_menu();
                         }
                     });

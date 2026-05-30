@@ -316,6 +316,36 @@ pub fn parse(log_file: &mut LogFile) {
     }
 }
 
+pub(super) fn parse_line(line: &str) -> crate::types::LineRecord {
+    let mut record = crate::types::LineRecord {
+        level: crate::types::LogLevel::Unknown,
+        ts_start: 0,
+        ts_len: 0,
+    };
+
+    if let Some(ts) = extract_timestamp(line) {
+        let offset = ts.as_ptr() as usize - line.as_ptr() as usize;
+        record.ts_start = offset as u16;
+        record.ts_len = ts.len() as u8;
+    }
+
+    // plain text log level should be extracted from line if possible, similar to loader::detect_level.
+    let lower = line.to_lowercase();
+    if lower.contains("error") {
+        record.level = crate::types::LogLevel::Error;
+    } else if lower.contains("warn") {
+        record.level = crate::types::LogLevel::Warn;
+    } else if lower.contains("info") {
+        record.level = crate::types::LogLevel::Info;
+    } else if lower.contains("debug") {
+        record.level = crate::types::LogLevel::Debug;
+    } else if lower.contains("trace") {
+        record.level = crate::types::LogLevel::Trace;
+    }
+
+    record
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests (run with `cargo test -p engine`)
 // ---------------------------------------------------------------------------

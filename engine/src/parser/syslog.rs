@@ -179,6 +179,53 @@ pub fn parse(log_file: &mut LogFile) {
     }
 }
 
+pub(super) fn parse_line(line: &str) -> crate::types::LineRecord {
+    let mut record = crate::types::LineRecord {
+        level: LogLevel::Unknown,
+        ts_start: 0,
+        ts_len: 0,
+    };
+    
+    // First, do a general loader-style detection.
+    let lower = line.to_lowercase();
+    if lower.contains("error") {
+        record.level = LogLevel::Error;
+    } else if lower.contains("warn") {
+        record.level = LogLevel::Warn;
+    } else if lower.contains("info") {
+        record.level = LogLevel::Info;
+    } else if lower.contains("debug") {
+        record.level = LogLevel::Debug;
+    } else if lower.contains("trace") {
+        record.level = LogLevel::Trace;
+    }
+
+    let trimmed = line.trim_start();
+    if let Some(ts) = try_parse_timestamp(trimmed) {
+        let offset = ts.as_ptr() as usize - line.as_ptr() as usize;
+        record.ts_start = offset as u16;
+        record.ts_len = ts.len() as u8;
+
+        // Refine level from message portion only (syslog behavior)
+        if let Some(msg) = extract_message(trimmed, ts) {
+            let msg_lower = msg.to_lowercase();
+            if msg_lower.contains("error") {
+                record.level = LogLevel::Error;
+            } else if msg_lower.contains("warn") {
+                record.level = LogLevel::Warn;
+            } else if msg_lower.contains("info") {
+                record.level = LogLevel::Info;
+            } else if msg_lower.contains("debug") {
+                record.level = LogLevel::Debug;
+            } else if msg_lower.contains("trace") {
+                record.level = LogLevel::Trace;
+            }
+        }
+    }
+
+    record
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

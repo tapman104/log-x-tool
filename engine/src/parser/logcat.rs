@@ -139,6 +139,32 @@ pub fn parse(log_file: &mut LogFile) {
     }
 }
 
+pub(super) fn parse_line(line: &str) -> crate::types::LineRecord {
+    let mut record = crate::types::LineRecord {
+        level: LogLevel::Unknown,
+        ts_start: 0,
+        ts_len: 0,
+    };
+
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("--------- beginning") {
+        return record;
+    }
+
+    if let Some(ts) = try_parse_timestamp(trimmed) {
+        let offset = ts.as_ptr() as usize - line.as_ptr() as usize;
+        record.ts_start = offset as u16;
+        record.ts_len = ts.len() as u8;
+
+        let after_ts = &trimmed[ts.len()..];
+        if let Some(level) = parse_level_from_fields(after_ts) {
+            record.level = level;
+        }
+    }
+
+    record
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

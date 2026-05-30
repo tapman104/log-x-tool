@@ -258,6 +258,41 @@ pub fn parse(log_file: &mut LogFile) {
     }
 }
 
+pub(super) fn parse_line(line: &str) -> crate::types::LineRecord {
+    let mut record = crate::types::LineRecord {
+        level: LogLevel::Unknown,
+        ts_start: 0,
+        ts_len: 0,
+    };
+    
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return record;
+    }
+    
+    for &key in TS_KEYS {
+        if let Some(val) = extract_string_field(trimmed, key) {
+            let offset = val.as_ptr() as usize - line.as_ptr() as usize;
+            record.ts_start = offset as u16;
+            record.ts_len = val.len() as u8;
+            break;
+        }
+    }
+    
+    for &key in LVL_KEYS {
+        if let Some(val) = extract_string_field(trimmed, key) {
+            record.level = level_from_str(val);
+            break;
+        }
+        if let Some(n) = extract_number_field(trimmed, key) {
+            record.level = level_from_str(&n.to_string());
+            break;
+        }
+    }
+    
+    record
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

@@ -1,27 +1,39 @@
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
-use engine::{load_file, parse_file, AppError, LogFile, LogLevel};
+// load_file is deprecated in favour of engine::index_file for large files;
+// the UI migration will happen in a follow-up step.
+#[allow(deprecated)]
+use engine::{AppError, LogLevel};
 
 // ── Background loader ──────────────────────────────────────────────────────
+
+enum LoadProgress {
+    Progress { scanned: u64, total: u64 },
+    Done(Result<(engine::ParsedIndex, [usize; 6], u64), AppError>),
+}
 
 /// Handle to an in-progress file-load spawned on a worker thread.
 struct LoadTask {
     /// Path being loaded (shown in spinner / title bar).
     path: PathBuf,
-    /// Receives `Ok(LogFile)` or `Err(AppError)` from the worker thread.
-    rx: mpsc::Receiver<Result<LogFile, AppError>>,
+    rx: mpsc::Receiver<LoadProgress>,
+}
+
+struct SearchTask {
+    /// Receives batches of matching indices as the search progresses.
+    /// Indices are sent as `u32` (RoaringBitmap's native element type).
+    rx: mpsc::Receiver<Vec<u32>>,
+    /// Sending a value to this channel cancels the worker.
+    cancel_tx: mpsc::SyncSender<()>,
 }
 
 // ── App state ──────────────────────────────────────────────────────────────
 
 pub struct LogViewerApp {
-    /// Last successfully loaded file.
-    log_file: Option<LogFile>,
-    err_count: usize,
-    warn_count: usize,
-    info_count: usize,
-    debug_count: usize,
+    /// Last successfully loaded index.
+    parsed: Option<Arc<engine::ParsedIndex>>,
+    level_counts: [usize; 6], // indexed by LogLevel as usize
     /// Present while a background load is running.
     load_task: Option<LoadTask>,
     /// Most-recent error shown in the status bar.
@@ -48,19 +60,29 @@ pub struct LogViewerApp {
     // Caches
     last_search: String,
     last_level_filter: Option<LogLevel>,
-    filtered_indices: Vec<usize>,
+    /// Compressed bitmap of row indices that pass the current filter.
+    /// Uses ~12 MB for 100 M consecutive entries vs ~800 MB for Vec<usize>.
+    filtered_bitmap: roaring::RoaringBitmap,
+    /// Cached length so the UI never calls `.len()` (O(n)) on the bitmap per frame.
+    filtered_count: u64,
     search_counts: (usize, usize, usize, usize, usize),
     needs_filter_update: bool,
+    search_task: Option<SearchTask>,
+    search_complete: bool,
+    search_debounce: std::time::Instant,
+
+    load_progress: Option<(u64, u64)>,
+    parse_duration: Option<std::time::Duration>,
+    file_size_bytes: u64,
+    match_cursor: Option<usize>,
+    load_start_time: Option<std::time::Instant>,
 }
 
 impl Default for LogViewerApp {
     fn default() -> Self {
         let mut app = Self {
-            log_file: None,
-            err_count: 0,
-            warn_count: 0,
-            info_count: 0,
-            debug_count: 0,
+            parsed: None,
+            level_counts: [0; 6],
             load_task: None,
             last_error: None,
             dark_mode: true,
@@ -72,9 +94,18 @@ impl Default for LogViewerApp {
             focus_search: false,
             last_search: String::new(),
             last_level_filter: None,
-            filtered_indices: Vec::new(),
+            filtered_bitmap: roaring::RoaringBitmap::new(),
+            filtered_count: 0,
             search_counts: (0, 0, 0, 0, 0),
             needs_filter_update: false,
+            search_task: None,
+            search_complete: false,
+            search_debounce: std::time::Instant::now(),
+            load_progress: None,
+            parse_duration: None,
+            file_size_bytes: 0,
+            match_cursor: None,
+            load_start_time: None,
             last_dir: None,
             recent_files: Vec::new(),
         };
@@ -124,18 +155,26 @@ impl LogViewerApp {
     }
 
     fn export_filtered(&self) {
-        if let Some(ref lf) = self.log_file {
+        if let Some(ref parsed) = self.parsed {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Export filtered log")
                 .save_file()
             {
-                if let Ok(file) = std::fs::File::create(path) {
-                    use std::io::Write;
-                    let mut writer = std::io::BufWriter::new(file);
-                    for &i in &self.filtered_indices {
-                        let _ = writeln!(writer, "{}", lf.entries[i].raw);
+                // Collect line strings off the UI thread; iterate the bitmap directly
+                // rather than cloning it into a Vec<usize>.
+                let lines: Vec<String> = self.filtered_bitmap
+                    .iter()
+                    .map(|i| parsed.lines.line_str(i as usize).to_owned())
+                    .collect();
+                std::thread::spawn(move || {
+                    if let Ok(file) = std::fs::File::create(path) {
+                        use std::io::Write;
+                        let mut writer = std::io::BufWriter::new(file);
+                        for line in &lines {
+                            let _ = writeln!(writer, "{}", line);
+                        }
                     }
-                }
+                });
             }
         }
     }
@@ -148,11 +187,27 @@ impl LogViewerApp {
     /// Any previous task / error is discarded; the old file stays visible
     /// until the new one arrives, avoiding a blank flash.
     fn spawn_load(&mut self, path: PathBuf) {
-        let (tx, rx) = mpsc::channel::<Result<LogFile, AppError>>();
+        let (tx, rx) = mpsc::channel::<LoadProgress>();
         let path_clone = path.clone();
+        
+        self.load_start_time = Some(std::time::Instant::now());
+        self.load_progress = None;
+
         std::thread::spawn(move || {
-            // Send the full AppError — no string conversion on the worker side.
-            let _ = tx.send(load_file(&path_clone));
+            let tx_clone = tx.clone();
+            let res = engine::index_file_with_progress(&path_clone, move |scanned, total| {
+                let _ = tx_clone.send(LoadProgress::Progress { scanned, total });
+            }).map(|idx| {
+                let parsed = engine::parse_index(idx);
+                let mut counts = [0usize; 6];
+                for r in &parsed.records {
+                    let c_idx: usize = r.level.into();
+                    counts[c_idx] += 1;
+                }
+                let file_size_bytes = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
+                (parsed, counts, file_size_bytes)
+            });
+            let _ = tx.send(LoadProgress::Done(res));
         });
         self.load_task = Some(LoadTask { path, rx });
         self.last_error = None;
@@ -172,17 +227,28 @@ impl LogViewerApp {
     /// Non-blocking poll of the background task.
     /// Integrates the result into `log_file` / `last_error` when ready.
     fn poll_load_task(&mut self) {
-        // Two-step: extract result (drops immutable borrow), then mutate.
-        let result = if let Some(ref t) = self.load_task {
-            t.rx.try_recv().ok()
-        } else {
-            None
-        };
+        let mut final_outcome = None;
+        if let Some(ref t) = self.load_task {
+            while let Ok(msg) = t.rx.try_recv() {
+                match msg {
+                    LoadProgress::Progress { scanned, total } => {
+                        self.load_progress = Some((scanned, total));
+                    }
+                    LoadProgress::Done(res) => {
+                        final_outcome = Some(res);
+                        break;
+                    }
+                }
+            }
+        }
 
-        if let Some(outcome) = result {
+        if let Some(outcome) = final_outcome {
             let path = self.load_task.take().unwrap().path;
+            if let Some(start) = self.load_start_time.take() {
+                self.parse_duration = Some(start.elapsed());
+            }
             match outcome {
-                Ok(mut lf) => {
+                Ok((parsed, counts, file_size)) => {
                     if let Some(parent) = path.parent() {
                         self.last_dir = Some(parent.to_path_buf());
                     }
@@ -191,29 +257,11 @@ impl LogViewerApp {
                     self.recent_files.truncate(5);
                     self.save_config();
 
-                    parse_file(&mut lf);
-                    
-                    let mut errs = 0;
-                    let mut warns = 0;
-                    let mut infos = 0;
-                    let mut debugs = 0;
-                    for e in &lf.entries {
-                        match e.level {
-                            Some(LogLevel::Error) => errs += 1,
-                            Some(LogLevel::Warn) => warns += 1,
-                            Some(LogLevel::Info) => infos += 1,
-                            Some(LogLevel::Debug) => debugs += 1,
-                            _ => {}
-                        }
-                    }
-                    self.err_count = errs;
-                    self.warn_count = warns;
-                    self.info_count = infos;
-                    self.debug_count = debugs;
-
+                    self.level_counts = counts;
+                    self.file_size_bytes = file_size;
                     self.needs_filter_update = true;
 
-                    self.log_file = Some(lf);
+                    self.parsed = Some(Arc::new(parsed));
                     self.last_error = None;
                 }
                 Err(e) => {
@@ -221,6 +269,68 @@ impl LogViewerApp {
                 }
             }
         }
+    }
+
+    fn spawn_search(&mut self, parsed: Arc<engine::ParsedIndex>, query: String, level: Option<LogLevel>) {
+        // Cancel any in-flight search
+        if let Some(ref t) = self.search_task {
+            let _ = t.cancel_tx.try_send(());
+        }
+        self.filtered_bitmap.clear();
+        self.filtered_count = 0;
+        self.search_complete = false;
+
+        let (result_tx, result_rx) = mpsc::channel::<Vec<u32>>();
+        let (cancel_tx, cancel_rx) = mpsc::sync_channel::<()>(1);
+
+        std::thread::spawn(move || {
+            let query_lower = query.to_lowercase();
+            let query_bytes = query_lower.as_bytes();
+            let mut batch: Vec<u32> = Vec::with_capacity(4096);
+
+            for i in 0..parsed.lines.len() {
+                if cancel_rx.try_recv().is_ok() { return; }
+
+                // RoaringBitmap indices are u32; files with ≥ 2^32 lines are not
+                // supported at current hardware limits.
+                assert!(i < u32::MAX as usize, "line index exceeds u32::MAX");
+
+                let passes_level = match &level {
+                    Some(lvl) => parsed.level_of(i) == *lvl,
+                    None => true,
+                };
+                let passes_search = query_bytes.is_empty()
+                    || memchr::memmem::find(parsed.lines.line_bytes(i), query_bytes).is_some();
+
+                if passes_level && passes_search {
+                    batch.push(i as u32);
+                    if batch.len() == 4096 {
+                        if result_tx.send(std::mem::take(&mut batch)).is_err() { return; }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = result_tx.send(batch);
+            }
+        });
+
+        self.search_task = Some(SearchTask { rx: result_rx, cancel_tx });
+    }
+
+    fn poll_search_task(&mut self) {
+        let done = if let Some(ref t) = self.search_task {
+            loop {
+                match t.rx.try_recv() {
+                    Ok(batch) => {
+                        self.filtered_bitmap.extend(batch);
+                        self.filtered_count = self.filtered_bitmap.len();
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break false,
+                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                }
+            }
+        } else { true };
+        if done { self.search_task = None; self.search_complete = true; }
     }
 }
 
@@ -243,16 +353,30 @@ impl eframe::App for LogViewerApp {
             ctx.request_repaint();
         }
 
+        self.poll_search_task();
+        if self.search_task.is_some() {
+            ctx.request_repaint();
+        }
+        if self.search_task.is_none()
+            && self.search_debounce.elapsed() > std::time::Duration::from_millis(150)
+            && self.needs_filter_update
+        {
+            self.needs_filter_update = false;
+            if let Some(ref p) = self.parsed {
+                self.spawn_search(Arc::clone(p), self.search.clone(), self.level_filter.clone());
+            }
+        }
+
         // ── Dynamic title bar ────────────────────────────────────────────────
         let title = if let Some(ref t) = self.load_task {
             format!(
                 "Log Viewer — Loading {}…",
                 t.path.file_name().unwrap_or_default().to_string_lossy()
             )
-        } else if let Some(ref lf) = self.log_file {
+        } else if let Some(ref parsed) = self.parsed {
             format!(
                 "Log Viewer — {}",
-                lf.path.file_name().unwrap_or_default().to_string_lossy()
+                parsed.lines.path.file_name().unwrap_or_default().to_string_lossy()
             )
         } else {
             "Log Viewer".to_string()
@@ -282,15 +406,21 @@ impl eframe::App for LogViewerApp {
                     if !self.recent_files.is_empty() {
                         ui.separator();
                         ui.menu_button("Recent Files", |ui| {
-                            for path in self.recent_files.clone() {
+                            // FIX 4: avoid cloning the whole Vec; collect only the
+                            // one path the user clicked (if any) outside the iterator.
+                            let mut to_open: Option<PathBuf> = None;
+                            for path in self.recent_files.iter() {
                                 if ui.button(path.display().to_string()).clicked() {
                                     ui.close_menu();
-                                    self.spawn_load(path);
+                                    to_open = Some(path.clone());
                                 }
+                            }
+                            if let Some(p) = to_open {
+                                self.spawn_load(p);
                             }
                         });
                     }
-                    if !self.filtered_indices.is_empty() {
+                    if self.filtered_count > 0 {
                         ui.separator();
                         if ui.button("Export filtered…").clicked() {
                             ui.close_menu();
@@ -342,10 +472,38 @@ impl eframe::App for LogViewerApp {
             self.level_filter = None;
         }
 
-        // ── Error / status bar (dismissible) ─────────────────────────────────
+        // ── Status bar (always visible) ──────────────────────────────────────
+        if let Some(ref parsed) = self.parsed {
+            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let format_str = if parsed.format.is_empty() { "Unknown" } else { &parsed.format };
+                    
+                    let lines = parsed.lines.len();
+                    let s = lines.to_string();
+                    let bytes = s.as_bytes();
+                    let mut lines_fmt = String::with_capacity(s.len() + s.len() / 3);
+                    for (i, &b) in bytes.iter().enumerate() {
+                        if i > 0 && (bytes.len() - i) % 3 == 0 {
+                            lines_fmt.push(',');
+                        }
+                        lines_fmt.push(b as char);
+                    }
+                    
+                    let file_gb = self.file_size_bytes as f64 / 1_000_000_000.0;
+                    let parsed_s = self.parse_duration.unwrap_or_default().as_secs_f64();
+                    
+                    ui.label(format!(
+                        "Format: {}   |   Lines: {}   |   File: {:.1} GB   |   Parsed in {:.1} s",
+                        format_str, lines_fmt, file_gb, parsed_s
+                    ));
+                });
+            });
+        }
+
+        // ── Error bar (dismissible) ──────────────────────────────────────────
         if self.last_error.is_some() {
             let err = self.last_error.clone().unwrap();
-            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("error_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &err);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -368,7 +526,16 @@ impl eframe::App for LogViewerApp {
                     .into_owned();
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.add(egui::Spinner::new().size(48.0));
+                    if let Some((scanned, total)) = self.load_progress {
+                        let pct = scanned as f32 / total as f32;
+                        ui.add(egui::ProgressBar::new(pct)
+                            .show_percentage()
+                            .animate(true)
+                            .text(format!("{:.1} / {:.1} GB",
+                                scanned as f64 / 1e9, total as f64 / 1e9)));
+                    } else {
+                        ui.add(egui::Spinner::new().size(48.0));
+                    }
                     ui.add_space(16.0);
                     ui.label(
                         egui::RichText::new(format!("Loading  {file_name}…"))
@@ -376,21 +543,21 @@ impl eframe::App for LogViewerApp {
                             .color(egui::Color32::from_gray(160)),
                     );
                 });
-            } else if self.log_file.is_some() {
+            } else if self.parsed.is_some() {
                 // ── Loaded state ─────────────────────────────────────────────
                 // Extract display info while releasing the borrow before the
                 // mutable TextEdit borrow of self.search below.
                 let (name, format_badge, entry_count, err_count, warn_count) = {
-                    let lf = self.log_file.as_ref().unwrap();
-                    let name = lf
+                    let parsed = self.parsed.as_ref().unwrap();
+                    let name = parsed.lines
                         .path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("<unknown>")
                         .to_owned();
-                    let badge = lf.format.clone().unwrap_or_default();
+                    let badge = parsed.format.clone();
 
-                    (name, badge, lf.entries.len(), self.err_count, self.warn_count)
+                    (name, badge, parsed.lines.len(), self.level_counts[0], self.level_counts[1])
                 };
 
                 // Header row — filename + format badge + total line count
@@ -459,84 +626,97 @@ impl eframe::App for LogViewerApp {
                 // Search bar
                 ui.horizontal(|ui| {
                     ui.label("🔍");
-                    let search_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search…")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if self.focus_search {
-                        search_resp.request_focus();
-                        self.focus_search = false;
+                    
+                    let mut next_clicked = false;
+                    let mut prev_clicked = false;
+                    
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3)) {
+                        next_clicked = true;
                     }
-                    if !self.search.is_empty()
-                        && ui.small_button("✕").on_hover_text("Clear search").clicked()
-                    {
-                        self.search.clear();
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3)) {
+                        prev_clicked = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.filtered_count > 0 {
+                            if ui.button("▼").clicked() {
+                                next_clicked = true;
+                            }
+                            if ui.button("▲").clicked() {
+                                prev_clicked = true;
+                            }
+                            let m = self.filtered_count as usize;
+                            let n = self.match_cursor.unwrap_or(0) + 1;
+                            ui.label(format!("{} / {}", n.min(m), m));
+                        }
+
+                        if !self.search.is_empty()
+                            && ui.small_button("✕").on_hover_text("Clear search").clicked()
+                        {
+                            self.search.clear();
+                        }
+
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let search_resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .hint_text("Search…")
+                                    .desired_width(ui.available_width()),
+                            );
+                            if self.focus_search {
+                                search_resp.request_focus();
+                                self.focus_search = false;
+                            }
+                        });
+                    });
+
+                    if next_clicked || prev_clicked {
+                        let m = self.filtered_count as usize;
+                        if m > 0 {
+                            let mut cursor = self.match_cursor.unwrap_or(0);
+                            if next_clicked {
+                                cursor = (cursor + 1) % m;
+                            } else {
+                                cursor = cursor.checked_sub(1).unwrap_or(m - 1);
+                            }
+                            self.match_cursor = Some(cursor);
+                            // select(rank) is O(log n) and gives the (rank)th set bit.
+                            let line_idx = self.filtered_bitmap
+                                .select(cursor as u32)
+                                .expect("cursor within bitmap bounds") as usize;
+                            self.scroll_to_line = Some(line_idx + 1);
+                        }
                     }
                 });
 
                 ui.add_space(2.0);
 
-                if let Some(ref lf) = self.log_file {
+                if let Some(ref parsed) = self.parsed {
                     let search_changed = self.search != self.last_search;
                     let level_changed = self.level_filter != self.last_level_filter;
 
-                    if search_changed || level_changed || self.needs_filter_update {
-                        self.needs_filter_update = false;
+                    if search_changed || level_changed {
                         self.last_search = self.search.clone();
                         self.last_level_filter = self.level_filter.clone();
-
-                        let search_lower = self.search.to_lowercase();
-                        self.filtered_indices.clear();
-
-                        if search_changed || self.search_counts == (0, 0, 0, 0, 0) {
-                            let mut all = 0;
-                            let mut err = 0;
-                            let mut warn = 0;
-                            let mut info = 0;
-                            let mut debug = 0;
-
-                            for e in &lf.entries {
-                                if self.search.is_empty() || e.raw.to_lowercase().contains(&search_lower) {
-                                    all += 1;
-                                    match e.level {
-                                        Some(LogLevel::Error) => err += 1,
-                                        Some(LogLevel::Warn) => warn += 1,
-                                        Some(LogLevel::Info) => info += 1,
-                                        Some(LogLevel::Debug) => debug += 1,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            self.search_counts = (all, err, warn, info, debug);
-                        }
-
-                        let is_search_empty = self.search.is_empty();
-                        let active_level = self.level_filter.clone();
-
-                        self.filtered_indices.extend(
-                            lf.entries.iter().enumerate().filter_map(|(i, e)| {
-                                let passes_search = is_search_empty || e.raw.to_lowercase().contains(&search_lower);
-                                let passes_level = match active_level {
-                                    Some(ref lvl) => e.level.as_ref() == Some(lvl),
-                                    None => true,
-                                };
-                                if passes_search && passes_level {
-                                    Some(i)
-                                } else {
-                                    None
-                                }
-                            })
-                        );
+                        self.needs_filter_update = true;
+                        self.search_debounce = std::time::Instant::now();
+                        self.match_cursor = None;
                     }
+
+                    // With the background search task, we revert to showing global counts on the filter buttons.
+                    let all = parsed.lines.len();
+                    let err = self.level_counts[0];
+                    let warn = self.level_counts[1];
+                    let info = self.level_counts[2];
+                    let debug = self.level_counts[3];
+                    self.search_counts = (all, err, warn, info, debug);
 
                     crate::log_panel::show_log_panel(
                         ui,
-                        lf,
+                        parsed,
                         &self.search,
                         &mut self.level_filter,
                         &mut self.scroll_to_line,
-                        &self.filtered_indices,
+                        &self.filtered_bitmap,
                         self.search_counts,
                     );
                 }
@@ -567,5 +747,37 @@ impl eframe::App for LogViewerApp {
                 });
             }
         });
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// Verify that a fully-open filter over 100 M rows fits within the
+    /// stated memory budget.  A dense range [0, 100_000_000) serialises to
+    /// ~12 MB in roaring's native format — well under the 50 MB cap stated
+    /// in the spec.
+    #[test]
+    fn bitmap_dense_100m_under_50mb() {
+        use roaring::RoaringBitmap;
+
+        const N: u32 = 100_000_000;
+        const LIMIT_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+
+        let bitmap: RoaringBitmap = (0..N).collect();
+        assert_eq!(bitmap.len(), N as u64, "all entries must be present");
+
+        // Serialise to measure compressed size.
+        let mut buf: Vec<u8> = Vec::new();
+        bitmap
+            .serialize_into(&mut buf)
+            .expect("serialization must succeed");
+
+        assert!(
+            buf.len() < LIMIT_BYTES,
+            "serialized size {} bytes exceeds {LIMIT_BYTES} byte limit",
+            buf.len(),
+        );
     }
 }

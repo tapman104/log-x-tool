@@ -103,3 +103,118 @@ pub fn parse_file(log_file: &mut LogFile) {
         LogFormat::Json      => json::parse(log_file),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming parsing (Phase 2)
+// ---------------------------------------------------------------------------
+
+use crate::types::{LineIndex, ParsedIndex, LineRecord};
+use rayon::prelude::*;
+
+fn detect_format_index(index: &LineIndex) -> LogFormat {
+    if let Some(ext) = index.path.extension().and_then(|e| e.to_str()) {
+        match ext.to_lowercase().as_str() {
+            "json" | "jsonl" | "ndjson" => return LogFormat::Json,
+            "log" | "txt" | "out" => {} // fall through to content sniff
+            _ => {}
+        }
+    }
+
+    if index.len() > 0 {
+        let line = index.line_str(0).trim_start();
+        if line.starts_with("--------- beginning")
+            || logcat::try_parse_timestamp(line).is_some()
+        {
+            return LogFormat::Logcat;
+        }
+
+        if syslog::try_parse_timestamp(line).is_some() {
+            return LogFormat::Syslog;
+        }
+
+        if line.starts_with('{') || line.starts_with('[') {
+            return LogFormat::Json;
+        }
+    }
+
+    LogFormat::PlainText
+}
+
+pub fn parse_index(mut index: LineIndex) -> ParsedIndex {
+    let fmt = detect_format_index(&index);
+
+    let format_name = match fmt {
+        LogFormat::PlainText => "Plain text",
+        LogFormat::Logcat    => "Logcat",
+        LogFormat::Syslog    => "Syslog",
+        LogFormat::Json      => "JSON",
+    }.to_owned();
+    
+    index.format = Some(format_name.clone());
+
+    let records: Vec<LineRecord> = (0..index.len())
+        .into_par_iter()
+        .map(|i| {
+            let line = index.line_str(i);
+            match fmt {
+                LogFormat::PlainText => plaintext::parse_line(line),
+                LogFormat::Logcat    => logcat::parse_line(line),
+                LogFormat::Syslog    => syslog::parse_line(line),
+                LogFormat::Json      => json::parse_line(line),
+            }
+        })
+        .collect();
+
+    ParsedIndex {
+        lines: index,
+        records,
+        format: format_name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::LogLevel;
+    use std::path::PathBuf;
+
+    fn temp_file_with_content(content: &str, ext: &str) -> PathBuf {
+        use std::io::Write;
+        let mut temp_file = tempfile::Builder::new().suffix(ext).tempfile().unwrap();
+        temp_file.write_all(content.as_bytes()).unwrap();
+        temp_file.into_temp_path().keep().unwrap()
+    }
+
+    #[test]
+    fn parse_index_logcat() {
+        let content = "--------- beginning of main\n05-28 14:23:05.123 1234 5678 I Tag: info msg\n05-28 14:23:06.456 1234 5678 E Tag: err msg\n";
+        let path = temp_file_with_content(content, ".log");
+        let index = crate::loader::index_file(&path).unwrap();
+        let parsed = parse_index(index);
+        
+        assert_eq!(parsed.format, "Logcat");
+        assert_eq!(parsed.records.len(), 3);
+        
+        // Line 0: banner
+        assert_eq!(parsed.level_of(0), LogLevel::Unknown);
+        assert_eq!(parsed.timestamp_of(0), None);
+        
+        // Line 1: Info
+        assert_eq!(parsed.level_of(1), LogLevel::Info);
+        assert_eq!(parsed.timestamp_of(1), Some("05-28 14:23:05.123"));
+        
+        // Line 2: Error
+        assert_eq!(parsed.level_of(2), LogLevel::Error);
+        assert_eq!(parsed.timestamp_of(2), Some("05-28 14:23:06.456"));
+    }
+
+    #[test]
+    fn parse_index_syslog() {
+        let content = "Jan 15 14:23:05 host p: msg";
+        let path = temp_file_with_content(content, ".txt");
+        let index = crate::loader::index_file(&path).unwrap();
+        let parsed = parse_index(index);
+        
+        assert_eq!(parsed.format, "Syslog");
+    }
+}

@@ -5,9 +5,9 @@ mod log_panel;
 
 fn main() -> eframe::Result<()> {
     let mut options = eframe::NativeOptions::default();
-    options.viewport.icon = std::sync::Arc::new(
-        eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon.png")[..]).unwrap()
-    ).into();
+    options.viewport.icon = eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon.png")[..])
+        .ok()
+        .map(std::sync::Arc::new);
     eframe::run_native(
         "Log Viewer",
         options,
