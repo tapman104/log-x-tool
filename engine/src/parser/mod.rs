@@ -172,6 +172,23 @@ pub fn parse_index(mut index: LineIndex) -> ParsedIndex {
     }
 }
 
+/// Parse a single log line into a [`LineRecord`] using the named format.
+///
+/// `format_name` must match the string stored in [`ParsedIndex::format`]
+/// (e.g. `"Plain text"`, `"Logcat"`, `"Syslog"`, `"JSON"`).
+/// Falls back to plain-text for unrecognised names.
+///
+/// Used by the follow-mode incremental updater to avoid re-running
+/// format detection on every newly appended line.
+pub fn parse_record(line: &str, format_name: &str) -> LineRecord {
+    match format_name {
+        "Logcat" => logcat::parse_line(line),
+        "Syslog" => syslog::parse_line(line),
+        "JSON"   => json::parse_line(line),
+        _        => plaintext::parse_line(line),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

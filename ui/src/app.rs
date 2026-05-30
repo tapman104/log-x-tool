@@ -76,6 +76,14 @@ pub struct LogViewerApp {
     file_size_bytes: u64,
     match_cursor: Option<usize>,
     load_start_time: Option<std::time::Instant>,
+
+    // ── Follow mode ──────────────────────────────────────────────────────────
+    /// When `true`, the app watches the file for new appended bytes and
+    /// auto-scrolls to the last line as they arrive.
+    follow_mode: bool,
+    /// OS file-system watcher.  Present iff `follow_mode` is `true`.
+    /// Dropping it automatically unregisters the OS watch.
+    watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl Default for LogViewerApp {
@@ -108,6 +116,8 @@ impl Default for LogViewerApp {
             load_start_time: None,
             last_dir: None,
             recent_files: Vec::new(),
+            follow_mode: false,
+            watcher: None,
         };
         app.load_config();
         app
@@ -187,9 +197,12 @@ impl LogViewerApp {
     /// Any previous task / error is discarded; the old file stays visible
     /// until the new one arrives, avoiding a blank flash.
     fn spawn_load(&mut self, path: PathBuf) {
+        // Opening a new file always exits follow mode for the previous file.
+        self.stop_following();
+
         let (tx, rx) = mpsc::channel::<LoadProgress>();
         let path_clone = path.clone();
-        
+
         self.load_start_time = Some(std::time::Instant::now());
         self.load_progress = None;
 
@@ -353,6 +366,122 @@ impl LogViewerApp {
         } else { true };
         if done { self.search_task = None; self.search_complete = true; }
     }
+
+    // ── Follow mode ──────────────────────────────────────────────────────────
+
+    /// Start watching the currently-loaded file for appended bytes.
+    ///
+    /// The OS watcher fires on any write event; its callback calls
+    /// `ctx.request_repaint()` so egui wakes from idle and `poll_follow` runs.
+    fn start_following(&mut self, ctx: egui::Context) {
+        use notify::{RecursiveMode, Watcher};
+        let path = match self.parsed.as_ref().map(|p| p.lines.path.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+        let ctx2 = ctx.clone();
+        let mut watcher = match notify::recommended_watcher(move |_| {
+            ctx2.request_repaint();
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                self.last_error = Some(format!("Follow: watcher error: {e}"));
+                return;
+            }
+        };
+        watcher.watch(&path, RecursiveMode::NonRecursive).ok();
+        self.watcher = Some(watcher);
+        self.follow_mode = true;
+    }
+
+    /// Stop following.  Dropping the watcher unregisters the OS watch.
+    fn stop_following(&mut self) {
+        self.watcher = None;
+        self.follow_mode = false;
+    }
+
+    /// Called every frame when `follow_mode` is active and no load/search is
+    /// in progress.  Handles both incremental growth and file rotation.
+    fn poll_follow(&mut self) {
+        let path = match self.parsed.as_ref().map(|p| p.lines.path.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let current_size = match std::fs::metadata(&path).map(|m| m.len() as usize) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let indexed_size = match self.parsed.as_ref() {
+            Some(p) => p.lines.mmap.len(),
+            None => return,
+        };
+
+        if current_size < indexed_size {
+            // ── File rotation detected ────────────────────────────────────────
+            // The file shrank (e.g. logrotate replaced it).  Stop following
+            // (watcher is dropped), then trigger a full re-index of the new
+            // file at the same path.  The user can click Follow again after.
+            self.stop_following();
+            self.spawn_load(path);
+            return;
+        }
+
+        if current_size == indexed_size {
+            return; // no change this frame
+        }
+
+        // ── File grew — incremental update ────────────────────────────────────
+        //
+        // Phase 1: mutate the ParsedIndex exclusively.  `Arc::get_mut` returns
+        // `Some` only when the refcount is 1 (no search worker holds a clone).
+        // If it returns `None` (rare: worker still winding down), we skip this
+        // frame and retry next frame — the watcher will fire again.
+        let first_new_line = {
+            let opt = self.parsed.as_mut().and_then(|arc| Arc::get_mut(arc));
+            opt.and_then(engine::append_new_lines)
+        };
+        // ↑ Mutable borrow of `self.parsed` ends here.
+
+        // Phase 2: update self fields now that the ParsedIndex borrow is gone.
+        if let Some(first_new_line) = first_new_line {
+            let total_lines = self.parsed.as_ref().map_or(0, |p| p.lines.len());
+
+            // Pre-compute filter params (avoids borrow conflicts inside the loop).
+            let query_lower = self.search.to_lowercase();
+            let query_bytes: Vec<u8> = query_lower.bytes().collect();
+            let level_filter = self.level_filter.clone();
+
+            // Walk only the new lines to update the bitmap and level counts.
+            if let Some(ref parsed) = self.parsed {
+                for i in first_new_line..total_lines {
+                    assert!(i < u32::MAX as usize, "line index exceeds u32::MAX");
+
+                    let level = parsed.records[i].level;
+                    self.level_counts[usize::from(level)] += 1;
+
+                    let passes_level = match &level_filter {
+                        Some(lvl) => level == *lvl,
+                        None => true,
+                    };
+                    let passes_search = query_bytes.is_empty()
+                        || memchr::memmem::find(
+                            parsed.lines.line_bytes(i),
+                            &query_bytes,
+                        )
+                        .is_some();
+
+                    if passes_level && passes_search {
+                        self.filtered_bitmap.insert(i as u32);
+                    }
+                }
+            }
+
+            self.filtered_count = self.filtered_bitmap.len();
+            // Auto-scroll to the last line so the user sees new output.
+            self.scroll_to_line = Some(total_lines);
+        }
+    }
 }
 
 // ── UI ─────────────────────────────────────────────────────────────────────
@@ -386,6 +515,13 @@ impl eframe::App for LogViewerApp {
             if let Some(ref p) = self.parsed {
                 self.spawn_search(Arc::clone(p), self.search.clone(), self.level_filter.clone());
             }
+        }
+
+        // ── Follow-mode polling ───────────────────────────────────────────────
+        // Only when idle: no load running and no search in flight (so that
+        // Arc::get_mut inside poll_follow has a good chance of succeeding).
+        if self.follow_mode && self.load_task.is_none() && self.search_task.is_none() {
+            self.poll_follow();
         }
 
         // ── Dynamic title bar ────────────────────────────────────────────────
@@ -460,8 +596,9 @@ impl eframe::App for LogViewerApp {
                         ui.close_menu();
                     }
                 });
-                // Quick-toggle icon pinned to the right edge of the bar.
+                // Right-pinned controls: Follow toggle + theme toggle.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Theme toggle
                     let icon = if self.dark_mode { "☀" } else { "🌙" };
                     if ui
                         .button(egui::RichText::new(icon).size(15.0))
@@ -473,6 +610,26 @@ impl eframe::App for LogViewerApp {
                         .clicked()
                     {
                         self.dark_mode = !self.dark_mode;
+                    }
+
+                    // Follow toggle — only shown when a file is open.
+                    if self.parsed.is_some() {
+                        ui.separator();
+                        let (follow_label, follow_hint) = if self.follow_mode {
+                            ("⏹ Following", "Stop following (file tail)")
+                        } else {
+                            ("⏺ Follow", "Auto-scroll as new lines are appended")
+                        };
+                        let btn = ui
+                            .button(egui::RichText::new(follow_label).size(13.0))
+                            .on_hover_text(follow_hint);
+                        if btn.clicked() {
+                            if self.follow_mode {
+                                self.stop_following();
+                            } else {
+                                self.start_following(ui.ctx().clone());
+                            }
+                        }
                     }
                 });
             });

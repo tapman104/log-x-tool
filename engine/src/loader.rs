@@ -142,6 +142,99 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// append_new_lines — incremental follow-mode updater
+// ---------------------------------------------------------------------------
+
+/// Extend `parsed` with any lines appended to its source file since the last
+/// index was built.
+///
+/// # What this does
+/// 1. Re-opens the source file and creates a fresh memory map (O(1) — no I/O).
+/// 2. Scans the bytes beyond the previously indexed region for `\n` characters.
+/// 3. Appends new byte offsets to `parsed.lines.offsets`.
+/// 4. Parses each new line into a [`crate::types::LineRecord`] and appends it
+///    to `parsed.records`, using the format already detected for this file.
+///
+/// # Return value
+/// Returns the 0-based index of the first newly added line inside
+/// `parsed.lines.offsets`, so the caller can update its filter bitmap for
+/// exactly those lines.  Returns `None` when:
+/// - The file has not grown (or is unavailable).
+/// - New bytes exist but contain no complete line yet (i.e. no `\n` found).
+///
+/// # Caller contract
+/// The caller must ensure exclusive (`&mut`) access to `parsed`; typically via
+/// `Arc::get_mut`.  The function never panics on a valid `ParsedIndex`.
+pub fn append_new_lines(parsed: &mut crate::types::ParsedIndex) -> Option<usize> {
+    let path = parsed.lines.path.clone();
+
+    // Open the file and build a fresh mmap — this is O(1) (OS page-table only).
+    let file = std::fs::File::open(&path).ok()?;
+    // Safety: read-only map; the file is not mutated by this process.
+    let new_mmap = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
+
+    let old_len = parsed.lines.mmap.len();
+    let new_len = new_mmap.len();
+
+    if new_len <= old_len {
+        // No growth — caller should treat this as "no rotation" since size
+        // comparisons for rotation happen before calling this function.
+        return None;
+    }
+
+    // Record where new lines will start in the offsets vector.
+    let first_new_line_idx = parsed.lines.offsets.len();
+
+    // Scan only the newly appended bytes.
+    let new_bytes = &new_mmap[old_len..new_len];
+
+    // If old content ended on a newline (or file was previously empty), the
+    // byte at `old_len` is the first byte of a brand-new line.
+    // If it did NOT end on a newline, `old_len` is a continuation of the last
+    // already-indexed line; we only push offsets for lines that start AFTER
+    // the next `\n` we find.
+    let old_ended_with_newline = old_len == 0
+        || new_mmap.get(old_len.wrapping_sub(1)) == Some(&b'\n');
+
+    let mut new_offsets: Vec<u64> = Vec::new();
+    if old_ended_with_newline && !new_bytes.is_empty() {
+        new_offsets.push(old_len as u64);
+    }
+    for (local_i, &b) in new_bytes.iter().enumerate() {
+        if b == b'\n' {
+            let next_start = old_len + local_i + 1;
+            // Only push if there are bytes after this newline.
+            if next_start < new_len {
+                new_offsets.push(next_start as u64);
+            }
+        }
+    }
+
+    if new_offsets.is_empty() {
+        // New bytes arrived but no complete line yet.  Still replace the mmap
+        // so the last (partial) line shows the latest bytes in the UI.
+        parsed.lines.mmap = new_mmap;
+        return None;
+    }
+
+    // Replace the mmap first so that `line_bytes` / `line_str` can see the
+    // new content as we parse it below.
+    parsed.lines.mmap = new_mmap;
+    parsed.lines.offsets.extend_from_slice(&new_offsets);
+
+    // Parse new records with the format already established for this file.
+    let format = parsed.format.clone();
+    let end = parsed.lines.offsets.len();
+    for i in first_new_line_idx..end {
+        let line = parsed.lines.line_str(i);
+        let record = crate::parser::parse_record(line, &format);
+        parsed.records.push(record);
+    }
+
+    Some(first_new_line_idx)
+}
+
+// ---------------------------------------------------------------------------
 // Tests for index_file / LineIndex
 // ---------------------------------------------------------------------------
 
